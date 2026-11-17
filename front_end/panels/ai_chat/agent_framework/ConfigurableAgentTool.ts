@@ -158,6 +158,12 @@ export interface AgentToolConfig {
   temperature?: number;
 
   /**
+   * When true, the live page is attached as a transient turn instead of the system prompt.
+   * Browser actors default this on from their name.
+   */
+  includePageContext?: boolean;
+
+  /**
    * Schema for the agent tool arguments
    */
   schema: {
@@ -584,6 +590,8 @@ export class ConfigurableAgentTool implements Tool<ConfigurableAgentArgs, Config
       nanoModel: callCtx.nanoModel,
       cdpAdapter: callCtx.cdpAdapter,
       onBeforeToolExecution: callCtx.onBeforeToolExecution,
+      includePageContext: this.config.includePageContext ??
+        /action|web_task|scroll|click|form|hover|keyboard/.test(this.name),
     };
 
     const descriptor = await AgentDescriptorRegistry.getDescriptor(this.name);

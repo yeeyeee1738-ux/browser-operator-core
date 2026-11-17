@@ -13,7 +13,7 @@ import { createSystemPromptAsync } from './GraphHelpers.js';
 import * as BaseOrchestratorAgent from './BaseOrchestratorAgent.js';
 import { ToolSurfaceProvider } from './ToolSurfaceProvider.js';
 import { createLogger } from './Logger.js';
-import type { AgentState } from './State.js';
+import { type AgentState, createUserMessage } from './State.js';
 import type { Runnable } from './Types.js';
 import { LLMConfigurationManager } from './LLMConfigurationManager.js';
 import { AgentErrorHandler } from './AgentErrorHandler.js';
@@ -21,6 +21,11 @@ import { createTracingProvider, withTracingContext } from '../tracing/TracingCon
 import * as ToolNameMap from './ToolNameMap.js';
 import type { TracingProvider } from '../tracing/TracingProvider.js';
 import { AgentDescriptorRegistry } from './AgentDescriptorRegistry.js';
+import { drainSteer } from '../runtime/steerBuffer.js';
+import { loadParentTransient } from '../runtime/parentTransient.js';
+import { pushAssistantToolCall, stripBatchIds, trailingToolCalls } from '../runtime/messageCoalesce.js';
+import { laneForTool, scheduleToolBatch } from '../runtime/toolLanes.js';
+import { capToolResult } from '../runtime/resultCap.js';
 
 const logger = createLogger('AgentNodes');
 
@@ -41,6 +46,17 @@ export function createAgentNode(modelName: string, provider: LLMProvider, temper
       if (signal?.aborted) {
         logger.info('AgentNode execution aborted');
         throw new DOMException('Agent execution was cancelled', 'AbortError');
+      }
+
+      const steered = drainSteer();
+      if (steered.length > 0) {
+        state = {
+          ...state,
+          messages: [
+            ...state.messages,
+            ...steered.map(text => createUserMessage(text)),
+          ],
+        };
       }
 
       logger.debug('AgentNode invoke called, messages count:', state.messages.length);
@@ -209,6 +225,11 @@ export function createAgentNode(modelName: string, provider: LLMProvider, temper
 
         // Convert ChatMessage[] to LLMMessage[]
         const llmMessages = this.convertChatMessagesToLLMMessages(state.messages, originalToSanitized);
+        const conversationId = state.context?.tracingContext?.sessionId;
+        llmMessages.push({
+          role: 'user',
+          content: await loadParentTransient(conversationId),
+        });
         
         // Create error handler for retry logic
         const errorHandler = AgentErrorHandler.createErrorHandler({
@@ -297,61 +318,62 @@ export function createAgentNode(modelName: string, provider: LLMProvider, temper
 
         // Directly create the ModelChatMessage object
         let newModelMessage: ModelChatMessage;
-        if (parsedAction.type === 'tool_call') {
-          const toolCallId = crypto.randomUUID(); // Generate unique ID for OpenAI format
-          const sanitizedToolName = ToolNameMap.getSanitized(parsedAction.name);
-          const resolvedToolName = ToolNameMap.resolveOriginal(parsedAction.name)
-            || ToolNameMap.resolveOriginal(sanitizedToolName)
-            || parsedAction.name;
-          
-          // Create tool-call event observation
-          const tracingContext = state.context?.tracingContext;
-          if (tracingContext?.traceId) {
-            const toolCallObservationId = `tool-call-${resolvedToolName}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-            await this.tracingProvider.createObservation({
-              id: toolCallObservationId,
-              name: `Tool Call Decision: ${resolvedToolName}`,
-              type: 'event',
-              startTime: new Date(),
-              parentObservationId: tracingContext.currentGenerationId || tracingContext.parentObservationId,
-              input: {
-                toolName: resolvedToolName,
-                toolArgs: parsedAction.args,
-                toolCallId,
-                reasoning: response.reasoning?.summary
-              },
-              metadata: {
-                llmModel: this.modelName,
-                callCount: this.callCount,
-                toolCallId,
-                phase: 'tool_call_decision',
-                provider: this.provider
-              }
-            }, tracingContext.traceId);
-            
-            // Update tracing context with tool call observation ID for tool execution
-            tracingContext.currentToolCallId = toolCallObservationId;
+        if (parsedAction.type === 'tool_call' || parsedAction.type === 'tool_calls') {
+          const calls = parsedAction.type === 'tool_calls'
+            ? parsedAction.calls
+            : [{ id: parsedAction.id, name: parsedAction.name, args: parsedAction.args }];
+          const batchId = calls.length > 1 ? crypto.randomUUID() : undefined;
+          const modelMessages: ModelChatMessage[] = [];
+          for (const call of calls) {
+            const toolCallId = call.id || crypto.randomUUID();
+            const sanitizedToolName = ToolNameMap.getSanitized(call.name);
+            const resolvedToolName = ToolNameMap.resolveOriginal(call.name)
+              || ToolNameMap.resolveOriginal(sanitizedToolName)
+              || call.name;
+            const tracingContext = state.context?.tracingContext;
+            if (tracingContext?.traceId) {
+              const toolCallObservationId = `tool-call-${resolvedToolName}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+              await this.tracingProvider.createObservation({
+                id: toolCallObservationId,
+                name: `Tool Call Decision: ${resolvedToolName}`,
+                type: 'event',
+                startTime: new Date(),
+                parentObservationId: tracingContext.currentGenerationId || tracingContext.parentObservationId,
+                input: {
+                  toolName: resolvedToolName,
+                  toolArgs: call.args,
+                  toolCallId,
+                  reasoning: response.reasoning?.summary
+                },
+                metadata: {
+                  llmModel: this.modelName,
+                  callCount: this.callCount,
+                  toolCallId,
+                  phase: 'tool_call_decision',
+                  provider: this.provider
+                }
+              }, tracingContext.traceId);
+              tracingContext.currentToolCallId = toolCallObservationId;
+            }
+            const regTool = ToolRegistry.getRegisteredTool(resolvedToolName as any);
+            const isAgentTool = !!regTool && (regTool instanceof ConfigurableAgentTool);
+            modelMessages.push({
+              entity: ChatMessageEntity.MODEL,
+              action: 'tool',
+              toolName: resolvedToolName,
+              toolArgs: call.args,
+              toolCallId,
+              isFinalAnswer: false,
+              reasoning: response.reasoning?.summary,
+              uiLane: isAgentTool ? 'agent' : 'chat',
+              parallelBatchId: batchId,
+            });
           }
-          
-          // Determine lane: agent tools render in agent lane only
-          const regTool = ToolRegistry.getRegisteredTool(resolvedToolName as any);
-          const isAgentTool = !!regTool && (regTool instanceof ConfigurableAgentTool);
-
-          newModelMessage = {
-            entity: ChatMessageEntity.MODEL,
-            action: 'tool',
-            toolName: resolvedToolName,
-             toolArgs: parsedAction.args,
-             toolCallId, // Add for linking with tool response
-             isFinalAnswer: false,
-             reasoning: response.reasoning?.summary,
-             uiLane: isAgentTool ? 'agent' : 'chat',
+          return {
+            ...state,
+            messages: [...state.messages, ...modelMessages],
+            error: undefined,
           };
-
-          logger.debug('AgentNode: Created tool message', { toolName: resolvedToolName, toolCallId });
-          if (resolvedToolName === 'finalize_with_critique') {
-            logger.debug('AgentNode: finalize_with_critique call with args:', JSON.stringify(parsedAction.args));
-          }
         } else if (parsedAction.type === 'final_answer') {
           newModelMessage = {
             entity: ChatMessageEntity.MODEL,
@@ -465,20 +487,12 @@ export function createAgentNode(modelName: string, provider: LLMProvider, temper
               content: msg.answer,
             });
           } else if ('action' in msg && msg.action === 'tool' && 'toolName' in msg && 'toolArgs' in msg && 'toolCallId' in msg) {
-            // Tool call message - convert from ModelChatMessage structure
             const fnName = originalToSanitized?.[msg.toolName!] || ToolNameMap.getSanitized(msg.toolName!);
-            llmMessages.push({
-              role: 'assistant',
-              content: undefined,
-              tool_calls: [{
-                id: msg.toolCallId!,
-                type: 'function' as const,
-                function: {
-                  name: fnName,
-                  arguments: JSON.stringify(msg.toolArgs),
-                }
-              }],
-            });
+            pushAssistantToolCall(llmMessages, {
+              id: msg.toolCallId!,
+              name: fnName,
+              arguments: JSON.stringify(msg.toolArgs),
+            }, msg.parallelBatchId);
           }
         } else if (msg.entity === ChatMessageEntity.TOOL_RESULT) {
           // Tool result message
@@ -499,7 +513,7 @@ export function createAgentNode(modelName: string, provider: LLMProvider, temper
         }
       }
       
-      return llmMessages;
+      return stripBatchIds(llmMessages);
     }
   }();
   return agentNode;
@@ -565,11 +579,40 @@ export function createToolExecutorNode(state: AgentState, provider: LLMProvider,
       this.nanoModel = nanoModel;
     }
 
+    private async executeBatch(state: AgentState, pending: ModelChatMessage[], signal?: AbortSignal): Promise<AgentState> {
+      const base = state.messages.slice(0, state.messages.length - pending.length);
+      const outcomes = await scheduleToolBatch(pending, call => {
+        const tool = this.toolMap.get(call.toolName || '');
+        return laneForTool(call.toolName || '', (tool as { lane?: 'read' | 'act' | 'file' | 'local' } | undefined)?.lane);
+      }, async call => {
+        const single: AgentState = {
+          ...state,
+          context: {
+            ...state.context,
+            tracingContext: state.context.tracingContext ? {...state.context.tracingContext} : undefined,
+          },
+          messages: [...base, call],
+        };
+        return this.invoke(single, signal);
+      });
+      const additions = outcomes.flatMap(outcome => outcome.messages.slice(base.length + 1));
+      return {
+        ...state,
+        messages: [...base, ...pending, ...additions],
+        error: outcomes.find(outcome => outcome.error)?.error,
+      };
+    }
+
     async invoke(state: AgentState, signal?: AbortSignal): Promise<AgentState> {
       // Check if execution has been aborted
       if (signal?.aborted) {
         logger.info('ToolExecutorNode execution aborted');
         throw new DOMException('Tool execution was cancelled', 'AbortError');
+      }
+
+      const pendingCalls = trailingToolCalls(state.messages);
+      if (pendingCalls.length > 1) {
+        return this.executeBatch(state, pendingCalls, signal);
       }
 
       const lastMessage = state.messages[state.messages.length - 1];
@@ -1014,6 +1057,8 @@ export function createToolExecutorNode(state: AgentState, provider: LLMProvider,
           }
         }
       }
+
+      resultText = capToolResult(resultText);
 
       // Create the NEW ToolResultMessage
       const isAgentTool = selectedTool instanceof ConfigurableAgentTool;

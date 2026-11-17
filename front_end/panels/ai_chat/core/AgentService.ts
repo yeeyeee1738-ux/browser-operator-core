@@ -83,6 +83,8 @@ import {createAgentGraph} from './Graph.js';
 import { createLogger } from './Logger.js';
 import { AgentDescriptorRegistry } from './AgentDescriptorRegistry.js';
 import {type AgentState, createInitialState, createUserMessage} from './State.js';
+import { drainSteer, pushSteer } from '../runtime/steerBuffer.js';
+import { RunCheckpointStore } from '../runtime/runCheckpoint.js';
 import type {CompiledGraph} from './Types.js';
 import { LLMClient } from '../LLM/LLMClient.js';
 import { LLMProviderRegistry } from '../LLM/LLMProviderRegistry.js';
@@ -544,6 +546,13 @@ export class AgentService extends AgentServiceBase {
       throw new Error('Empty message. Please enter some text.');
     }
 
+    if (this.#runningGraphStatePromise) {
+      pushSteer(text);
+      const queued = createUserMessage(text, imageInput);
+      this.dispatchEventToListeners(Events.MESSAGES_CHANGED, [...this.#state.messages, queued]);
+      return queued;
+    }
+
     // Auto-initialize graph if it's not ready (handles race conditions automatically)
     if (!this.#graph) {
       logger.info('Graph not initialized, initializing now...');
@@ -726,12 +735,37 @@ export class AgentService extends AgentServiceBase {
       for await (const currentState of this.#runningGraphStatePromise) {
         // Update our messages with the messages from the current step
         this.#state.messages = currentState.messages;
+        const last = currentState.messages[currentState.messages.length - 1];
+        const summary = last && 'text' in last && typeof last.text === 'string'
+          ? last.text
+          : last && 'answer' in last && typeof last.answer === 'string'
+            ? last.answer
+            : '';
+        RunCheckpointStore.save({
+          conversationId: this.#currentConversationId || this.#sessionId,
+          status: 'running',
+          iteration: currentState.messages.length,
+          url: currentPageUrl,
+          summary: summary.slice(0, 500),
+          queue: [],
+          updatedAt: Date.now(),
+        });
 
         // Notify listeners of message update immediately
         this.dispatchEventToListeners(Events.MESSAGES_CHANGED, [...this.#state.messages]);
 
         // Don't auto-save during iteration - wait for completion
       }
+
+      RunCheckpointStore.save({
+        conversationId: this.#currentConversationId || this.#sessionId,
+        status: 'complete',
+        iteration: this.#state.messages.length,
+        url: currentPageUrl,
+        summary: 'complete',
+        queue: [],
+        updatedAt: Date.now(),
+      });
 
       // Schedule auto-save after loop completes with final state
       void this.#scheduleAutoSave();
@@ -786,11 +820,26 @@ export class AgentService extends AgentServiceBase {
       // Clear running state - final message has already been sent to listeners at line 583
       this.#runningGraphStatePromise = undefined;
 
+      const steered = drainSteer();
+      if (steered.length > 0) {
+        return this.sendMessage(steered.join('\n\n'));
+      }
+
       // Return the most recent message (could be final answer, tool call, or error)
       return finalMessage;
 
     } catch (error) {
       logger.error('Error running agent:', error);
+      const aborted = error instanceof Error && error.name === 'AbortError';
+      RunCheckpointStore.save({
+        conversationId: this.#currentConversationId || this.#sessionId,
+        status: aborted ? 'complete' : 'running',
+        iteration: this.#state.messages.length,
+        url: currentPageUrl,
+        summary: aborted ? 'cancelled' : 'interrupted',
+        queue: [],
+        updatedAt: Date.now(),
+      });
 
       // Create an error message from the model
       const errorMessage: ModelChatMessage = {
@@ -845,6 +894,11 @@ export class AgentService extends AgentServiceBase {
       }
       this.#abortController = undefined;
       this.#runningGraphStatePromise = undefined;
+
+      const steered = drainSteer();
+      if (steered.length > 0) {
+        return this.sendMessage(steered.join('\n\n'));
+      }
 
       return errorMessage;
     }
@@ -977,6 +1031,11 @@ export class AgentService extends AgentServiceBase {
         title: result.conversation.title
       });
 
+      const checkpoint = RunCheckpointStore.load(conversationId);
+      if (checkpoint?.status === 'running') {
+        void this.sendMessage('Continue the interrupted task from the saved checkpoint. Do not repeat work already finished.');
+      }
+
       return true;
     } catch (error) {
       logger.error('Failed to load conversation', { error, conversationId });
@@ -994,6 +1053,10 @@ export class AgentService extends AgentServiceBase {
     // Clear any pending auto-save timeout and abort execution
     this.#clearAutoSaveTimeout();
     this.cancelRun();
+
+    if (this.#currentConversationId) {
+      RunCheckpointStore.clear(this.#currentConversationId);
+    }
 
     // Clear conversation ID
     this.#currentConversationId = null;

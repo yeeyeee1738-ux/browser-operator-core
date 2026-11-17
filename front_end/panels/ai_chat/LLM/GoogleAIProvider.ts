@@ -6,6 +6,7 @@ import type { LLMMessage, LLMResponse, LLMCallOptions, LLMProvider, ModelInfo, M
 import { LLMBaseProvider } from './LLMProvider.js';
 import { LLMRetryManager } from './LLMErrorHandler.js';
 import { LLMResponseParser } from './LLMResponseParser.js';
+import { setFunctionCalls } from './functionCalls.js';
 import { createLogger } from '../core/Logger.js';
 
 const logger = createLogger('GoogleAIProvider');
@@ -246,17 +247,22 @@ export class GoogleAIProvider extends LLMBaseProvider {
       throw new Error('No content parts in Google AI candidate');
     }
 
-    const part = content.parts[0];
-
-    // Check for function call
-    if (part.functionCall) {
-      result.functionCall = {
-        name: part.functionCall.name,
-        arguments: part.functionCall.args || {}
-      };
-    } else if (part.text) {
-      // Plain text response
-      result.text = part.text.trim();
+    const functionCalls: Array<{ name: string; arguments: unknown }> = [];
+    let text = '';
+    for (const part of content.parts) {
+      if (part.functionCall) {
+        functionCalls.push({
+          name: part.functionCall.name,
+          arguments: part.functionCall.args || {},
+        });
+      } else if (part.text) {
+        text += part.text;
+      }
+    }
+    if (functionCalls.length > 0) {
+      setFunctionCalls(result, functionCalls);
+    } else if (text.trim()) {
+      result.text = text.trim();
     }
 
     return result;

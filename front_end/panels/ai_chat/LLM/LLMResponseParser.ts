@@ -50,12 +50,25 @@ export class LLMResponseParser {
    * Equivalent to OpenAIClient.parseOpenAIResponse
    */
   static parseResponse(response: UnifiedLLMResponse): ParsedLLMAction {
+    if (response.functionCalls && response.functionCalls.length > 1) {
+      return {
+        type: 'tool_calls',
+        calls: response.functionCalls.map(call => ({
+          id: call.id,
+          name: call.name,
+          args: call.arguments && typeof call.arguments === 'object' && !Array.isArray(call.arguments)
+            ? call.arguments as Record<string, unknown>
+            : { value: call.arguments },
+        })),
+      };
+    }
     // Check for function calls first
     if (response.functionCall) {
       return {
         type: 'tool_call',
         name: response.functionCall.name,
         args: response.functionCall.arguments,
+        id: response.functionCalls?.[0]?.id,
       };
     }
 

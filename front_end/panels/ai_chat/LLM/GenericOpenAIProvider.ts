@@ -6,6 +6,7 @@ import type { LLMMessage, LLMResponse, LLMCallOptions, LLMProvider, ModelInfo } 
 import { LLMBaseProvider } from './LLMProvider.js';
 import { LLMRetryManager } from './LLMErrorHandler.js';
 import { LLMResponseParser } from './LLMResponseParser.js';
+import { setFunctionCalls } from './functionCalls.js';
 import { createLogger } from '../core/Logger.js';
 
 const logger = createLogger('GenericOpenAIProvider');
@@ -200,23 +201,17 @@ export class GenericOpenAIProvider extends LLMBaseProvider {
       throw new Error(`No message in ${this.displayName} choice`);
     }
 
-    // Check for tool calls
     if (message.tool_calls && message.tool_calls.length > 0) {
-      const toolCall = message.tool_calls[0];
-      if (toolCall.function) {
-        try {
-          result.functionCall = {
-            name: toolCall.function.name,
-            arguments: JSON.parse(toolCall.function.arguments)
-          };
-        } catch (error) {
-          logger.error('Error parsing function arguments:', error);
-          result.functionCall = {
-            name: toolCall.function.name,
-            arguments: toolCall.function.arguments // Keep as string if parsing fails
-          };
+      setFunctionCalls(result, message.tool_calls.flatMap((toolCall: { id?: string; function?: { name: string; arguments: unknown } }) => {
+        if (!toolCall.function) {
+          return [];
         }
-      }
+        return [{
+          id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+        }];
+      }));
     } else if (message.content) {
       // Plain text response
       result.text = message.content.trim();

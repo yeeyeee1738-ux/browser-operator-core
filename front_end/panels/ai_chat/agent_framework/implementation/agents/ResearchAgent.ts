@@ -24,7 +24,9 @@ export function createResearchAgentConfig(): AgentToolConfig {
       color: '#3b82f6',
       backgroundColor: '#f8fafc'
     },
-    systemPrompt: `You are a research agent. Execute systematic research using your tools autonomously.
+    systemPrompt: `You are a research agent. Read pages with fetcher_tool. It fetches many URLs at once and reuses a session cache. Open the browser only when a page cannot be read that way.
+
+Execute systematic research using your tools autonomously.
 
 ## Task Inputs & Scope
 - **query**: Research objective

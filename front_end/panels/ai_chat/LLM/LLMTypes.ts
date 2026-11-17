@@ -77,6 +77,11 @@ export interface UnifiedLLMResponse {
     name: string;
     arguments: any;
   };
+  functionCalls?: Array<{
+    id?: string;
+    name: string;
+    arguments: any;
+  }>;
   rawResponse?: any;
   reasoning?: {
     summary?: string[] | null;
@@ -98,7 +103,8 @@ export interface ModelOption {
  * Standardized structure for parsed LLM actions
  */
 export type ParsedLLMAction =
-  | { type: 'tool_call'; name: string; args: Record<string, unknown> }
+  | { type: 'tool_call'; name: string; args: Record<string, unknown>; id?: string }
+  | { type: 'tool_calls'; calls: Array<{ id?: string; name: string; args: Record<string, unknown> }> }
   | { type: 'final_answer'; answer: string }
   | { type: 'error'; error: string };
 
@@ -220,6 +226,11 @@ export interface LLMResponse {
     name: string;
     arguments: any;
   };
+  functionCalls?: Array<{
+    id?: string;
+    name: string;
+    arguments: any;
+  }>;
   rawResponse: any;
   reasoning?: {
     summary?: string[] | null;

@@ -6,6 +6,7 @@ import type { LLMMessage, LLMResponse, LLMCallOptions, LLMProvider, ModelInfo, M
 import { LLMBaseProvider } from './LLMProvider.js';
 import { LLMRetryManager } from './LLMErrorHandler.js';
 import { LLMResponseParser } from './LLMResponseParser.js';
+import { setFunctionCalls } from './functionCalls.js';
 import { createLogger } from '../core/Logger.js';
 
 const logger = createLogger('AnthropicProvider');
@@ -222,20 +223,19 @@ export class AnthropicProvider extends LLMBaseProvider {
       throw new Error('No content in Anthropic response');
     }
 
-    // Process content blocks
+    const toolUses: Array<{ id?: string; name: string; arguments: unknown }> = [];
     for (const block of data.content) {
       if (block.type === 'text') {
         result.text = (result.text || '') + block.text;
       } else if (block.type === 'tool_use') {
-        // First tool use becomes the function call
-        if (!result.functionCall) {
-          result.functionCall = {
-            name: block.name,
-            arguments: block.input || {}
-          };
-        }
+        toolUses.push({
+          id: block.id,
+          name: block.name,
+          arguments: block.input || {},
+        });
       }
     }
+    setFunctionCalls(result, toolUses);
 
     if (result.text) {
       result.text = result.text.trim();

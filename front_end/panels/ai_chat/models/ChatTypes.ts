@@ -47,6 +47,8 @@ export interface ModelChatMessage extends BaseChatMessage {
   isFinalAnswer: boolean;
   reasoning?: string[] | null;
   toolCallId?: string;
+  /** Groups tool calls that were requested in one model turn. */
+  parallelBatchId?: string;
 }
 
 // Tool result message

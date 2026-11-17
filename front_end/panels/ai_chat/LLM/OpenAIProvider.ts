@@ -6,6 +6,7 @@ import type { LLMMessage, LLMResponse, LLMCallOptions, LLMProvider, ModelInfo, M
 import { LLMBaseProvider } from './LLMProvider.js';
 import { LLMRetryManager } from './LLMErrorHandler.js';
 import { LLMResponseParser } from './LLMResponseParser.js';
+import { setFunctionCalls } from './functionCalls.js';
 import { createLogger } from '../core/Logger.js';
 import { BUILD_CONFIG } from '../core/BuildConfig.js';
 
@@ -147,31 +148,25 @@ export class OpenAIProvider extends LLMBaseProvider {
    */
   private convertMessagesToResponsesAPI(messages: LLMMessage[], modelFamily: ModelFamily): any[] {
     try {
-      return messages.map((msg, index) => {
+      return messages.flatMap((msg, index): any[] => {
         if (msg.role === 'system' || msg.role === 'user') {
-          return {
+          return [{
             role: msg.role,
             content: this.convertContentToResponsesAPI(msg.content, modelFamily)
-          };
+          }];
         } else if (msg.role === 'assistant') {
           if (msg.tool_calls && msg.tool_calls.length > 0) {
-            // Convert tool calls to responses API format
-            const toolCall = msg.tool_calls[0]; // Take first tool call
-            let argsString: string;
-            
-            // Ensure arguments are in string format for responses API
-            if (typeof toolCall.function.arguments === 'string') {
-              argsString = toolCall.function.arguments;
-            } else {
-              argsString = JSON.stringify(toolCall.function.arguments);
-            }
-            
-            return {
-              type: 'function_call',
-              name: toolCall.function.name,
-              arguments: argsString,
-              call_id: toolCall.id
-            } as ResponsesAPIFunctionCall;
+            return msg.tool_calls.map(toolCall => {
+              const argsString = typeof toolCall.function.arguments === 'string'
+                ? toolCall.function.arguments
+                : JSON.stringify(toolCall.function.arguments);
+              return {
+                type: 'function_call',
+                name: toolCall.function.name,
+                arguments: argsString,
+                call_id: toolCall.id
+              } as ResponsesAPIFunctionCall;
+            });
           } else {
             // Regular assistant message with content
             // For O-series models, assistant content uses 'output_text'
@@ -179,26 +174,23 @@ export class OpenAIProvider extends LLMBaseProvider {
               const content = typeof msg.content === 'string' ? msg.content : 
                              Array.isArray(msg.content) ? msg.content.map(c => c.type === 'text' ? c.text : '').join('') :
                              String(msg.content || '');
-              return {
+              return [{
                 role: 'assistant',
                 content: [{ type: 'output_text', text: content }]
-              };
+              }];
             } else {
-              // For GPT models, use simple content format
-              return {
+              return [{
                 role: 'assistant',
                 content: this.convertContentToResponsesAPI(msg.content, modelFamily)
-              };
+              }];
             }
           }
         } else if (msg.role === 'tool') {
-          // Convert tool result to responses API format
-          // Tool responses are always text in the current implementation
-          return {
+          return [{
             type: 'function_call_output',
             call_id: msg.tool_call_id,
             output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
-          } as ResponsesAPIFunctionOutput;
+          } as ResponsesAPIFunctionOutput];
         }
         
         throw new Error(`Unknown message role at index ${index}: ${msg.role}`);
@@ -231,23 +223,15 @@ export class OpenAIProvider extends LLMBaseProvider {
 
     if (data.output && data.output.length > 0) {
       // Find function call or message by type instead of assuming position
-      const functionCallOutput = data.output.find((item: any) => item.type === 'function_call');
+      const functionCallOutputs = data.output.filter((item: any) => item.type === 'function_call');
       const messageOutput = data.output.find((item: any) => item.type === 'message');
 
-      if (functionCallOutput) {
-        // Process function call
-        try {
-          result.functionCall = {
-            name: functionCallOutput.name,
-            arguments: JSON.parse(functionCallOutput.arguments)
-          };
-        } catch (error) {
-          logger.error('Error parsing function arguments:', error);
-          result.functionCall = {
-            name: functionCallOutput.name,
-            arguments: functionCallOutput.arguments // Keep as string if parsing fails
-          };
-        }
+      if (functionCallOutputs.length > 0) {
+        setFunctionCalls(result, functionCallOutputs.map((functionCallOutput: { id?: string; call_id?: string; name: string; arguments: unknown }) => ({
+          id: functionCallOutput.call_id || functionCallOutput.id,
+          name: functionCallOutput.name,
+          arguments: functionCallOutput.arguments,
+        })));
       }
       else if (messageOutput?.content && messageOutput.content.length > 0 && messageOutput.content[0].type === 'output_text') {
         // Process text response

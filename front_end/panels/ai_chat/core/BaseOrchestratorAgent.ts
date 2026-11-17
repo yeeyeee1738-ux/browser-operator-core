@@ -38,6 +38,8 @@ import {
 import { SaveResearchReportTool } from '../tools/SaveResearchReportTool.js';
 import { SearchCustomAgentsTool } from '../tools/SearchCustomAgentsTool.js';
 import { CallCustomAgentTool } from '../tools/CallCustomAgentTool.js';
+import { RunWorkQueueTool } from '../tools/RunWorkQueueTool.js';
+import { PreferConnectorTool } from '../tools/PreferConnectorTool.js';
 import { MemoryModule } from '../memory/index.js';
 
 // Initialize configured agents (including custom agents from Agent Studio)
@@ -58,6 +60,8 @@ export enum BaseOrchestratorAgentType {
 // System prompts for each agent type (WITHOUT memory instructions - added dynamically)
 export const SYSTEM_PROMPTS = {
   [BaseOrchestratorAgentType.SEARCH]: `You are an search browser agent specialized in pinpoint web fact-finding.
+Before any browser task, call prefer_connector. If it returns a tool, call that connector and skip the tab.
+For several independent lookups or site tasks, call run_work_queue once. Workers lease the items. Do not wait on one subagent before starting the next.
 Always delegate investigative work to the 'search_agent' tool so it can gather verified, structured results (emails, team rosters, niche professionals, etc.).
 
 - Launch search_agent with a clear objective, attribute list, filters, and quantity requirement.
@@ -69,6 +73,8 @@ Always delegate investigative work to the 'search_agent' tool so it can gather v
 Clarify ambiguous requests before delegating.`,
 
   [BaseOrchestratorAgentType.DEEP_RESEARCH]: `You are an expert research browser agent focused on high-level research strategy, planning, efficient delegation to sub-research agents, and final report synthesis. Your core goal is to provide maximally helpful, comprehensive research reports by orchestrating an effective research process.
+
+Before browsing, call prefer_connector. For independent subtasks, call run_work_queue once with read items (url) and act items (goal and url). The queue runs them together. You are called again when the queue finishes or an item is blocked.
 
 ## Research Process
 
@@ -325,6 +331,8 @@ export const AGENT_CONFIGS: {[key: string]: AgentConfig} = {
       new ListFilesTool(),
       new SearchCustomAgentsTool(),
       new CallCustomAgentTool(),
+      new RunWorkQueueTool(),
+      new PreferConnectorTool(),
       ToolRegistry.getToolInstance('search_memory_agent') || (() => { throw new Error('search_memory_agent tool not found'); })(),
     ]
   },
@@ -352,6 +360,8 @@ export const AGENT_CONFIGS: {[key: string]: AgentConfig} = {
       new ListFilesTool(),
       new SearchCustomAgentsTool(),
       new CallCustomAgentTool(),
+      new RunWorkQueueTool(),
+      new PreferConnectorTool(),
       ToolRegistry.getToolInstance('search_memory_agent') || (() => { throw new Error('search_memory_agent tool not found'); })(),
     ]
   },

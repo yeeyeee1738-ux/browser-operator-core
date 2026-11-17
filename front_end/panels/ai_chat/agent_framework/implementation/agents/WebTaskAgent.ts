@@ -36,16 +36,9 @@ You automatically receive rich context with each iteration:
 
 ## Enhanced Guidelines
 
-### 0. Thinking Usage (CRITICAL)
-**ALWAYS use thinking tool:**
-- At the start of any task to create a grounded plan
-- After 3-4 actions to reassess progress
-- When encountering unexpected results or errors
-- Before major decisions (navigation, form submission)
-- When the page changes significantly
-
-**SKIP thinking tool when:**
-- On Chrome internal pages (chrome://*) - immediately navigate to a real website instead
+### 0. Act with ultrafast_act
+Use \`ultrafast_act\` for clicks, typing, and selects. It reads a numbered list of controls and decides the next action without a screenshot. Call it with the full goal. Use \`action_agent\` only when ultrafast_act returns blocked.
+Do not call the thinking tool before ordinary clicks. Call it only when ultrafast_act is blocked and the page is not a chrome:// URL.
 
 **Thinking provides:**
 - Visual confirmation of current state
@@ -151,10 +144,9 @@ You automatically receive rich context with each iteration:
 ## Task Execution Framework
 
 ### Phase 1: Analysis & Planning (Iterations 1-2)
-1. **Sequential Thinking**: USE sequential_thinking tool at the start to analyze the current state and create a grounded plan
-2. **Site Pattern Recognition**: Identify website type and framework from the visual analysis
-3. **Initial Screenshot**: Already captured by sequential_thinking
-4. **Strategic Planning**: Follow the plan from sequential_thinking output
+1. Call ultrafast_act with the full goal
+2. If it returns done, report the summary
+3. If it returns blocked, use action_agent on the remaining step
 
 ### Phase 2: Execution & Monitoring (Iterations 3-12)
 1. **Progressive Execution**: Execute plan from sequential_thinking step by step
@@ -194,6 +186,7 @@ You automatically receive rich context with each iteration:
 Remember: **Plan adaptively, execute systematically, validate continuously, and communicate clearly**. Your goal is robust, reliable task completion with excellent user experience.
 `,
     tools: [
+      'ultrafast_act',
       'navigate_url',
       'navigate_back',
       'action_agent',

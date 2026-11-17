@@ -8,7 +8,6 @@ import { ChatMessageEntity, type ChatMessage } from '../models/ChatTypes.js';
 import * as BaseOrchestratorAgent from './BaseOrchestratorAgent.js';
 import { createLogger } from './Logger.js';
 import { LLMConfigurationManager } from './LLMConfigurationManager.js';
-import { enhancePromptWithPageContext } from './PageInfoManager.js';
 import type { AgentState } from './State.js';
 import { NodeType } from './Types.js';
 
@@ -42,10 +41,8 @@ export async function createSystemPromptAsync(state: AgentState): Promise<string
       BaseOrchestratorAgent.getSystemPrompt(selectedAgentType) :
       BaseOrchestratorAgent.getSystemPrompt('default'));
 
-  // Use the enhancePromptWithPageContext function to add page info
-  const enhancedPrompt = await enhancePromptWithPageContext(basePrompt);
-
-  return enhancedPrompt;
+  // Page state is a transient turn inside AgentNode. The system prompt stays stable.
+  return basePrompt;
 }
 
 // Create the appropriate tools for the agent based on agent type

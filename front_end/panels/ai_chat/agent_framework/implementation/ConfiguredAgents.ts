@@ -43,6 +43,9 @@ import { createSearchAgentConfig } from './agents/SearchAgent.js';
 import { AgentStudioIntegration } from '../../core/AgentStudioIntegration.js';
 import { initializeMiniApps } from '../../mini_apps/MiniAppInitialization.js';
 import { registerDOMTools } from '../../tools/DOMToolsRegistration.js';
+import { UltrafastActTool } from '../../tools/UltrafastActTool.js';
+import { RunWorkQueueTool } from '../../tools/RunWorkQueueTool.js';
+import { PreferConnectorTool } from '../../tools/PreferConnectorTool.js';
 
 /**
  * Initialize all configured agents
@@ -186,6 +189,10 @@ export async function initializeConfiguredAgents(): Promise<void> {
   const searchMemoryAgentConfig = createMemoryAgentConfig('search');
   const searchMemoryAgent = new ConfigurableAgentTool(searchMemoryAgentConfig);
   ToolRegistry.registerToolFactory('search_memory_agent', () => searchMemoryAgent);
+
+  ToolRegistry.registerToolFactory('ultrafast_act', () => new UltrafastActTool());
+  ToolRegistry.registerToolFactory('run_work_queue', () => new RunWorkQueueTool());
+  ToolRegistry.registerToolFactory('prefer_connector', () => new PreferConnectorTool());
 
   // Initialize custom agents from Agent Studio
   await AgentStudioIntegration.initialize();

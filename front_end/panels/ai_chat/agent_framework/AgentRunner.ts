@@ -17,6 +17,10 @@ import { callLLMWithTracing } from '../tools/LLMTracingWrapper.js';
 import { sanitizeMessagesForModel } from '../LLM/MessageSanitizer.js';
 import { FileStorageManager } from '../tools/FileStorageManager.js';
 import { getRuntime } from './RuntimeContext.js';
+import { laneForTool, scheduleToolBatch } from '../runtime/toolLanes.js';
+import { pushAssistantToolCall, stripBatchIds } from '../runtime/messageCoalesce.js';
+import { capToolResult } from '../runtime/resultCap.js';
+import { drainSteer } from '../runtime/steerBuffer.js';
 
 const logger = createLogger('AgentRunner');
 
@@ -47,6 +51,8 @@ export interface AgentRunnerConfig {
   cdpAdapter?: import('../cdp/CDPSessionAdapter.js').CDPSessionAdapter;
   /** Called before each tool execution (for logging/debugging) */
   onBeforeToolExecution?: (toolName: string, toolArgs: unknown) => Promise<void>;
+  /** When true, the live page is added as a transient turn. The system prompt stays stable. */
+  includePageContext?: boolean;
 }
 
 /**
@@ -170,19 +176,11 @@ export class AgentRunner {
             content: modelMsg.answer,
           });
         } else if (modelMsg.action === 'tool' && modelMsg.toolCallId) {
-          // Tool call message
-          llmMessages.push({
-            role: 'assistant',
-            content: undefined,
-            tool_calls: [{
-              id: modelMsg.toolCallId,
-              type: 'function',
-              function: {
-                name: modelMsg.toolName || '',
-                arguments: JSON.stringify(modelMsg.toolArgs || {}),
-              }
-            }],
-          });
+          pushAssistantToolCall(llmMessages, {
+            id: modelMsg.toolCallId,
+            name: modelMsg.toolName || '',
+            arguments: JSON.stringify(modelMsg.toolArgs || {}),
+          }, modelMsg.parallelBatchId);
         }
       } else if (msg.entity === ChatMessageEntity.TOOL_RESULT) {
         // Tool result message
@@ -230,7 +228,7 @@ export class AgentRunner {
       }
     }
 
-    return llmMessages;
+    return stripBatchIds(llmMessages);
   }
 
   /**
@@ -275,7 +273,8 @@ export class AgentRunner {
     const treeResultIndices: number[] = [];
     messages.forEach((msg, i) => {
       if (msg.entity === ChatMessageEntity.TOOL_RESULT &&
-          (msg as ToolResultMessage).toolName === 'get_page_content') {
+          ((msg as ToolResultMessage).toolName === 'get_page_content' ||
+           (msg as ToolResultMessage).toolName === 'get_page_content_v1')) {
         treeResultIndices.push(i);
       }
     });
@@ -407,8 +406,7 @@ export class AgentRunner {
       });
     }
 
-    // Enhance the target agent's system prompt with page context
-    const enhancedSystemPrompt = await enhancePromptWithPageContext(targetConfig.systemPrompt);
+    const includePageContext = /action|web_task|scroll|click|form|hover|keyboard/.test(targetAgentTool.name);
 
     // Resolve model name for the target agent
     let resolvedModelName: string;
@@ -432,7 +430,8 @@ export class AgentRunner {
     const targetRunnerConfig: AgentRunnerConfig = {
       apiKey,
       modelName: resolvedModelName,
-      systemPrompt: enhancedSystemPrompt,
+      systemPrompt: targetConfig.systemPrompt,
+      includePageContext,
       tools: targetConfig.tools
               .map(toolName => ToolRegistry.getRegisteredTool(toolName))
               .filter((tool): tool is Tool<any, any> => tool !== null),
@@ -718,6 +717,12 @@ export class AgentRunner {
         currentSession.iterationCount = iteration + 1;
       }
       logger.info(`${agentName} Iteration ${iteration + 1}/${maxIterations}`);
+      for (const steered of drainSteer()) {
+        messages.push({
+          entity: ChatMessageEntity.USER,
+          text: steered,
+        });
+      }
 
       // Prepare prompt and call LLM
       const iterationInfo = `
@@ -747,9 +752,16 @@ export class AgentRunner {
         logger.debug(`Skipping todo injection for ${agentName} - update_todo tool not available`);
       }
 
-      // Enhance system prompt with iteration info, todos, and page context
-      // This includes updating the accessibility tree inside enhancePromptWithPageContext
-      const currentSystemPrompt = await enhancePromptWithPageContext(systemPrompt + iterationInfo + todosContext);
+      // The system prompt stays byte-stable so providers can cache it.
+      // Page state, todos, and the step counter are a transient turn.
+      let transientContext = `${iterationInfo}${todosContext}`;
+      if (config.includePageContext) {
+        const pageContext = await enhancePromptWithPageContext('');
+        if (pageContext.trim()) {
+          transientContext += `\n${pageContext}`;
+        }
+      }
+      const currentSystemPrompt = systemPrompt;
 
       let llmResponse: LLMResponse;
       let generationId: string | undefined; // Declare in iteration scope for tool call access
@@ -822,6 +834,10 @@ export class AgentRunner {
         // Prune old accessibility tree results to prevent context overflow
         const prunedMessages = AgentRunner.pruneAccessibilityTreeHistory(messages);
         const llmMessages = AgentRunner.convertToLLMMessages(prunedMessages);
+        llmMessages.push({
+          role: 'user',
+          content: `<runtime_context>\n${transientContext}\n</runtime_context>`,
+        });
 
         // Sanitize messages for model capabilities (strip images for non-vision models)
         let isVisionForMainCall = false;
@@ -979,12 +995,111 @@ export class AgentRunner {
 
       // Parse LLM response
       const llm = LLMClient.getInstance();
-      const parsedAction = llm.parseResponse(llmResponse);
+      let parsedAction = llm.parseResponse(llmResponse);
 
       // Process parsed action
       try {
         let newModelMessage: ModelChatMessage;
         let toolCallObservationId: string | undefined; // Declare in action scope for tool execution access
+
+        if (parsedAction.type === 'tool_calls') {
+          const handoffs = parsedAction.calls.filter(call => call.name.startsWith('handoff_to_'));
+          const regular = parsedAction.calls.filter(call => !call.name.startsWith('handoff_to_'));
+          if (regular.length > 0) {
+            const batchId = getRuntime().generateId();
+            const records = await scheduleToolBatch(regular, call => laneForTool(call.name), async call => {
+              const toolCallId = call.id || getRuntime().generateId();
+              const toolToExecute = toolMap.get(call.name);
+              const modelMessage: ModelChatMessage = {
+                entity: ChatMessageEntity.MODEL,
+                action: 'tool',
+                toolName: call.name,
+                toolArgs: call.args,
+                toolCallId,
+                isFinalAnswer: false,
+                parallelBatchId: batchId,
+              };
+              let resultText = '';
+              let toolIsError = false;
+              let toolResultData: unknown = null;
+              if (!toolToExecute) {
+                resultText = `Unknown tool: ${call.name}`;
+                toolIsError = true;
+              } else {
+                try {
+                  toolResultData = await toolToExecute.execute(call.args as any, {
+                    apiKey: config.apiKey,
+                    provider: config.provider,
+                    model: modelName,
+                    miniModel: config.miniModel,
+                    nanoModel: config.nanoModel,
+                    getVisionCapability: config.getVisionCapability,
+                    abortSignal,
+                    cdpAdapter: config.cdpAdapter,
+                  } as any);
+                  if (typeof toolResultData === 'object' && toolResultData !== null && 'success' in toolResultData) {
+                    const agentResult = toolResultData as { success?: boolean; output?: string; error?: string };
+                    resultText = capToolResult(agentResult.success
+                      ? (agentResult.output || 'Agent completed successfully')
+                      : (agentResult.error || 'Agent failed'));
+                    toolIsError = agentResult.success === false || Boolean(agentResult.error);
+                  } else {
+                    resultText = capToolResult(AgentRunner.computeToolResultText(toolResultData));
+                  }
+                } catch (err: any) {
+                  resultText = `Error during tool execution: ${err.message || String(err)}`;
+                  toolIsError = true;
+                  toolResultData = { error: resultText };
+                }
+              }
+              const toolResultMessage: ToolResultMessage = {
+                entity: ChatMessageEntity.TOOL_RESULT,
+                toolName: call.name,
+                resultText,
+                isError: toolIsError,
+                toolCallId,
+                ...(toolResultData ? { resultData: toolResultData } : {}),
+              };
+              return { modelMessage, toolResultMessage, toolCallId, toolIsError, resultText };
+            });
+            for (const record of records) {
+              messages.push(record.modelMessage);
+              addSessionMessage({
+                type: 'tool_call',
+                content: {
+                  type: 'tool_call',
+                  toolName: record.modelMessage.toolName || '',
+                  toolArgs: record.modelMessage.toolArgs || {},
+                  toolCallId: record.toolCallId,
+                },
+              });
+            }
+            for (const record of records) {
+              messages.push(record.toolResultMessage);
+              addSessionMessage({
+                type: 'tool_result',
+                content: {
+                  type: 'tool_result',
+                  toolCallId: record.toolCallId,
+                  toolName: record.modelMessage.toolName || '',
+                  success: !record.toolIsError,
+                  result: record.resultText,
+                  error: record.toolIsError ? record.resultText : undefined,
+                },
+              });
+            }
+          }
+          if (handoffs.length > 0) {
+            parsedAction = {
+              type: 'tool_call',
+              name: handoffs[0].name,
+              args: handoffs[0].args,
+              id: handoffs[0].id,
+            };
+          } else {
+            continue;
+          }
+        }
 
         if (parsedAction.type === 'tool_call') {
           const { name: toolName, args: toolArgs } = parsedAction;
@@ -1292,9 +1407,9 @@ export class AgentRunner {
               if (typeof toolResultData === 'object' && toolResultData !== null &&
                   'success' in toolResultData && ('output' in toolResultData || 'error' in toolResultData)) {
                 // This is a ConfigurableAgentResult from another agent
-                toolResultText = toolResultData.success
+                toolResultText = capToolResult(toolResultData.success
                   ? (toolResultData.output || 'Agent completed successfully')
-                  : (toolResultData.error || 'Agent failed');
+                  : (toolResultData.error || 'Agent failed'));
               } else {
                 // Regular tool result
                 toolResultText = AgentRunner.computeToolResultText(toolResultData, imageData);

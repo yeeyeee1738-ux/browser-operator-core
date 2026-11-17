@@ -3,8 +3,19 @@
 // found in the LICENSE file.
 
 import { createLogger } from '../core/Logger.js';
-import { ReadabilityExtractorTool, type ReadabilityExtractorResult } from './ReadabilityExtractorTool.js';
+import { ReadabilityExtractorTool } from './ReadabilityExtractorTool.js';
 import { NavigateURLTool, type Tool, type LLMContext } from './Tools.js';
+import { UrlContentCache } from '../runtime/urlContentCache.js';
+import { withReadSlot } from '../runtime/toolLanes.js';
+import { withIsolatedPage } from '../runtime/backgroundPage.js';
+
+let navigationLock: Promise<void> = Promise.resolve();
+
+function withNavigationLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = navigationLock.then(fn, fn);
+  navigationLock = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 const logger = createLogger('Tool:Fetcher');
 
@@ -95,28 +106,51 @@ export class FetcherTool implements Tool<FetcherToolArgs, FetcherToolResult> {
       };
     }
 
-    // Process all provided URLs
-    const urlsToProcess = urls;
-    const results: FetchedContent[] = [];
-
-    // Process each URL sequentially
-    for (const url of urlsToProcess) {
+    const results = await Promise.all(urls.map(url => withReadSlot(async () => {
       throwIfAborted();
+      const cached = UrlContentCache.get(url);
+      if (cached) {
+        return {
+          url,
+          title: cached.title,
+          markdownContent: cached.text,
+          success: true,
+        };
+      }
       try {
-        logger.info('Processing URL', { url });
-        const fetchedContent = await this.fetchContentFromUrl(url, reasoning, ctx);
-        results.push(fetchedContent);
+        const isolated = await withIsolatedPage(url, async evaluate => {
+          return await evaluate('({title: document.title, text: (document.body && document.body.innerText || "").slice(0, 20000)})') as { title?: string; text?: string } | undefined;
+        });
+        if (isolated?.text) {
+          UrlContentCache.set({ url, title: isolated.title || '', text: isolated.text, storedAt: Date.now() });
+          return {
+            url,
+            title: isolated.title || '',
+            markdownContent: isolated.text,
+            success: true,
+          };
+        }
+        const fetchedContent = await withNavigationLock(() => this.fetchContentFromUrl(url, reasoning, ctx));
+        if (fetchedContent.success && fetchedContent.markdownContent) {
+          UrlContentCache.set({
+            url,
+            title: fetchedContent.title,
+            text: fetchedContent.markdownContent,
+            storedAt: Date.now(),
+          });
+        }
+        return fetchedContent;
       } catch (error: any) {
         logger.error('Error processing URL', { url, error: error.message, stack: error.stack });
-        results.push({
+        return {
           url,
           title: '',
           markdownContent: '',
           success: false,
-          error: `Failed to process URL: ${error.message}`
-        });
+          error: `Failed to process URL: ${error.message}`,
+        };
       }
-    }
+    })));
 
     return {
       sources: results,
